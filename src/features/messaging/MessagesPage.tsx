@@ -18,9 +18,29 @@ export function MessagesPage() {
   const [loading, setLoading] = useState(true);
   const [newChatUser, setNewChatUser] = useState('');
   const [searchOpen, setSearchOpen] = useState(false);
+  const [friends, setFriends] = useState<Profile[]>([]);
+  const [sendError, setSendError] = useState<string | null>(null);
+  const [sending, setSending] = useState(false);
   const bottomRef = useRef<HTMLDivElement>(null);
   const activeRef = useRef(active);
   activeRef.current = active;
+
+  const loadFriends = useCallback(async () => {
+    if (!me) return;
+    const { data: rels } = await supabase
+      .from('friendships')
+      .select('user_id, friend_id')
+      .or(`user_id.eq.${me.id},friend_id.eq.${me.id}`);
+    const ids = (rels || []).map((r) => (r.user_id === me.id ? r.friend_id : r.user_id));
+    if (!ids.length) {
+      // fallback: show other profiles so chat still possible
+      const { data: all } = await supabase.from('profiles').select('*').neq('id', me.id).limit(20);
+      setFriends((all as Profile[]) || []);
+      return;
+    }
+    const { data: fps } = await supabase.from('profiles').select('*').in('id', ids).order('display_name');
+    setFriends((fps as Profile[]) || []);
+  }, [me]);
 
   const loadConvs = useCallback(async () => {
     if (!me) return;
@@ -53,7 +73,7 @@ export function MessagesPage() {
     setLoading(false);
   }, [me]);
 
-  useEffect(() => { loadConvs(); }, [loadConvs]);
+  useEffect(() => { loadConvs(); loadFriends(); }, [loadConvs, loadFriends]);
 
   // open from ?user=username
   useEffect(() => {
@@ -139,16 +159,56 @@ export function MessagesPage() {
 
   async function send(e: React.FormEvent) {
     e.preventDefault();
-    if (!text.trim() || !active || !me) return;
+    if (!text.trim() || !active || !me || sending) return;
     const body = text.trim();
     setText('');
+    setSendError(null);
+    setSending(true);
     const { data, error } = await supabase
       .from('messages')
       .insert({ conversation_id: active.id, sender_id: me.id, body })
       .select('*')
       .single();
-    if (!error && data) setMessages((m) => [...m, data as Message]);
+    setSending(false);
+    if (error) {
+      setSendError(error.message);
+      setBodySafe(body);
+      return;
+    }
+    if (data) setMessages((m) => [...m, data as Message]);
     void loadConvs();
+  }
+
+  function setBodySafe(body: string) {
+    setText(body);
+  }
+
+  async function startChatByProfile(p: Profile) {
+    if (!me) return;
+    const a = me.id < p.id ? me.id : p.id;
+    const bId = me.id < p.id ? p.id : me.id;
+    let { data: conv } = await supabase
+      .from('conversations')
+      .select('*')
+      .eq('user_a', a)
+      .eq('user_b', bId)
+      .maybeSingle();
+    if (!conv) {
+      const { data: created, error } = await supabase
+        .from('conversations')
+        .insert({ user_a: a, user_b: bId })
+        .select('*')
+        .single();
+      if (error) {
+        setSendError(error.message);
+        return;
+      }
+      conv = created;
+    }
+    setSearchOpen(false);
+    setNewChatUser('');
+    void loadConvs();
+    if (conv) setActive({ ...(conv as Conversation), other: p });
   }
 
   if (loading) return <div className="page"><Spinner /></div>;
@@ -162,19 +222,43 @@ export function MessagesPage() {
             <Button size="sm" onClick={() => setSearchOpen((v) => !v)}>✏️ New</Button>
           </div>
           {searchOpen && (
-            <form onSubmit={(e) => { e.preventDefault(); if (newChatUser.trim()) void startChat(newChatUser.trim().toLowerCase()); }} className="row" style={{ gap: 6 }}>
-              <input
-                className="input"
-                placeholder="Username…"
-                value={newChatUser}
-                onChange={(e) => setNewChatUser(e.target.value)}
-                style={{ borderRadius: 20, padding: '8px 12px' }}
-              />
-              <Button type="submit" size="sm">Go</Button>
-            </form>
+            <>
+              <form onSubmit={(e) => { e.preventDefault(); if (newChatUser.trim()) void startChat(newChatUser.trim().toLowerCase()); }} className="row" style={{ gap: 6, marginBottom: 8 }}>
+                <input
+                  className="input"
+                  placeholder="Type username…"
+                  value={newChatUser}
+                  onChange={(e) => setNewChatUser(e.target.value)}
+                  style={{ borderRadius: 20, padding: '8px 12px' }}
+                />
+                <Button type="submit" size="sm">Go</Button>
+              </form>
+              <div className="muted" style={{ fontSize: '0.78rem', marginBottom: 4 }}>Or pick a friend:</div>
+              <div style={{ maxHeight: 180, overflowY: 'auto' }}>
+                {friends.length === 0 && <div className="muted" style={{ fontSize: '0.8rem', padding: 6 }}>No friends yet — add friends first or type a username above.</div>}
+                {friends.map((f) => (
+                  <button
+                    key={f.id}
+                    className="row"
+                    style={{ width: '100%', padding: '6px 4px', gap: 8, borderRadius: 6, textAlign: 'left' }}
+                    onClick={() => void startChatByProfile(f)}
+                  >
+                    <Avatar url={f.avatar_url} name={f.display_name} size={28} />
+                    <span style={{ fontSize: '0.85rem', fontWeight: 600 }}>{f.display_name}</span>
+                    <span className="muted" style={{ fontSize: '0.75rem' }}>@{f.username}</span>
+                  </button>
+                ))}
+              </div>
+            </>
           )}
         </div>
-        {convs.length === 0 && <Empty message="No conversations yet." />}
+        {convs.length === 0 && !searchOpen && (
+          <div style={{ padding: 20, textAlign: 'center' }}>
+            <div style={{ fontSize: '2rem', marginBottom: 8 }}>💬</div>
+            <p className="muted" style={{ marginBottom: 12 }}>No chats yet.</p>
+            <Button size="sm" onClick={() => setSearchOpen(true)}>Start a chat</Button>
+          </div>
+        )}
         {convs.map((c) => (
           <div
             key={c.id}
@@ -219,14 +303,18 @@ export function MessagesPage() {
               ))}
               <div ref={bottomRef} />
             </div>
+            {sendError && (
+              <div className="error-text" style={{ padding: '4px 12px' }}>{sendError}</div>
+            )}
             <form onSubmit={send} className="chat-input-bar">
               <input
                 className="input"
                 placeholder="Aa"
                 value={text}
                 onChange={(e) => setText(e.target.value)}
+                disabled={sending}
               />
-              <Button type="submit" disabled={!text.trim()}>Send</Button>
+              <Button type="submit" disabled={!text.trim() || sending}>{sending ? '…' : 'Send'}</Button>
             </form>
           </>
         )}
