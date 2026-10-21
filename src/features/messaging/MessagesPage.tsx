@@ -11,7 +11,7 @@ import { timeAgo } from '../../lib/utils';
 type CallState = {
   active: boolean;
   type: 'audio' | 'video';
-  status: 'calling' | 'ringing' | 'connected' | 'ended' | 'rejected' | 'missed';
+  status: 'calling' | 'ringing' | 'connecting' | 'connected' | 'ended' | 'rejected' | 'missed';
   peerId: string | null;
 };
 
@@ -232,22 +232,79 @@ export function MessagesPage() {
     iceServers: [
       { urls: 'stun:stun.l.google.com:19302' },
       { urls: 'stun:global.stun.twilio.com:3478' },
+      { urls: 'turn:openrelay.metered.ca:80', username: 'openrelayproject', credential: 'openrelayproject' },
+      { urls: 'turn:openrelay.metered.ca:443', username: 'openrelayproject', credential: 'openrelayproject' },
+      { urls: 'turn:openrelay.metered.ca:443?transport=tcp', username: 'openrelayproject', credential: 'openrelayproject' },
     ],
   };
+  const pendingIceRef = useRef<RTCIceCandidateInit[]>([]);
+  const remoteDescSetRef = useRef(false);
+  const remoteAudioRef = useRef<HTMLAudioElement>(null);
 
   async function getMedia(video: boolean) {
     return navigator.mediaDevices.getUserMedia({
-      audio: true,
+      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
       video: video ? { width: 640, height: 480 } : false,
     });
   }
 
-  function attachStreams() {
-    if (localStream && localVideoRef.current) localVideoRef.current.srcObject = localStream;
-    if (remoteStream && remoteVideoRef.current) remoteVideoRef.current.srcObject = remoteStream;
+  function playRemote() {
+    const el = remoteAudioRef.current;
+    if (el && remoteStream) {
+      el.srcObject = remoteStream;
+      void el.play().catch(() => { /* ignore autoplay block */ });
+    }
+    if (localVideoRef.current && localStream) localVideoRef.current.srcObject = localStream;
+    if (remoteVideoRef.current && remoteStream) {
+      remoteVideoRef.current.srcObject = remoteStream;
+      void remoteVideoRef.current.play().catch(() => { /* ignore */ });
+    }
   }
 
-  useEffect(attachStreams);
+  useEffect(playRemote);
+
+  async function flushPendingIce(pc: RTCPeerConnection) {
+    const list = pendingIceRef.current.splice(0);
+    for (const c of list) {
+      try { await pc.addIceCandidate(new RTCIceCandidate(c)); } catch (e) { console.warn('flush ice', e); }
+    }
+  }
+
+  async function handleRemoteSdp(pc: RTCPeerConnection, sdp: RTCSessionDescriptionInit) {
+    await pc.setRemoteDescription(new RTCSessionDescription(sdp));
+    remoteDescSetRef.current = true;
+    await flushPendingIce(pc);
+  }
+
+  function wirePc(pc: RTCPeerConnection, myId: string, peerId: string) {
+    pc.ontrack = (ev) => {
+      console.log('[call] ontrack', ev.track.kind);
+      setRemoteStream(ev.streams[0]);
+    };
+    pc.onicecandidate = (ev) => {
+      if (ev.candidate && callChannelRef.current) {
+        void callChannelRef.current.send({
+          type: 'broadcast',
+          event: 'ice',
+          payload: { from: myId, to: peerId, candidate: ev.candidate.toJSON() },
+        });
+      }
+    };
+    pc.oniceconnectionstatechange = () => {
+      console.log('[call] ice state', pc.iceConnectionState);
+      if (pc.iceConnectionState === 'connected' || pc.iceConnectionState === 'completed') {
+        setCall((c) => (c.active ? { ...c, status: 'connected' } : c));
+      } else if (pc.iceConnectionState === 'failed' || pc.iceConnectionState === 'disconnected') {
+        setSendError('Call connection lost. Try again.');
+      }
+    };
+    pc.onconnectionstatechange = () => {
+      console.log('[call] conn state', pc.connectionState);
+      if (pc.connectionState === 'connected') {
+        setCall((c) => (c.active ? { ...c, status: 'connected' } : c));
+      }
+    };
+  }
 
   function cleanupCall() {
     localStream?.getTracks().forEach((t) => t.stop());
@@ -255,6 +312,9 @@ export function MessagesPage() {
     pcRef.current = null;
     setLocalStream(null);
     setRemoteStream(null);
+    pendingIceRef.current = [];
+    remoteDescSetRef.current = false;
+    if (remoteAudioRef.current) remoteAudioRef.current.srcObject = null;
     if (callChannelRef.current) {
       void supabase.removeChannel(callChannelRef.current);
       callChannelRef.current = null;
@@ -270,61 +330,50 @@ export function MessagesPage() {
     const peerId = active.other.id;
     setCall({ active: true, type, status: 'calling', peerId });
     setSendError(null);
+    pendingIceRef.current = [];
+    remoteDescSetRef.current = false;
 
     try {
       const stream = await getMedia(type === 'video');
       setLocalStream(stream);
-      if (localVideoRef.current) localVideoRef.current.srcObject = stream;
 
       const pc = new RTCPeerConnection(RTC_CONFIG);
       pcRef.current = pc;
       stream.getTracks().forEach((t) => pc.addTrack(t, stream));
-      pc.ontrack = (ev) => setRemoteStream(ev.streams[0]);
-      pc.onicecandidate = (ev) => {
-        if (ev.candidate && callChannelRef.current) {
-          void callChannelRef.current.send({
-            type: 'broadcast',
-            event: 'ice',
-            payload: { from: me.id, to: peerId, candidate: ev.candidate },
-          });
-        }
-      };
+      wirePc(pc, me.id, peerId);
 
-      // 1) notify callee on personal inbox channel
-      const inbox = supabase.channel(`inbox_${peerId}`);
-      await inbox.subscribe();
-      void inbox.send({
-        type: 'broadcast',
-        event: 'ring',
-        payload: { from: me.id, to: peerId, callType: type },
-      });
-      setTimeout(() => { void supabase.removeChannel(inbox); }, 2000);
-
-      // 2) join shared rtc channel
+      // join shared rtc channel first
       const ch = supabase.channel(rtcName(me.id, peerId));
       callChannelRef.current = ch;
 
       ch.on('broadcast', { event: 'ready' }, async ({ payload }) => {
         if (payload.to !== me.id) return;
-        // callee is ready — send offer
-        const offer = await pc.createOffer();
-        await pc.setLocalDescription(offer);
-        void ch.send({
-          type: 'broadcast',
-          event: 'offer',
-          payload: { from: me.id, to: peerId, sdp: offer, callType: type },
-        });
+        try {
+          const offer = await pc.createOffer();
+          await pc.setLocalDescription(offer);
+          void ch.send({
+            type: 'broadcast',
+            event: 'offer',
+            payload: { from: me.id, to: peerId, sdp: offer, callType: type },
+          });
+          console.log('[call] offer sent (on ready)');
+        } catch (e) { console.error('offer on ready', e); }
       });
       ch.on('broadcast', { event: 'answer' }, async ({ payload }) => {
         if (payload.to !== me.id) return;
         try {
-          await pc.setRemoteDescription(new RTCSessionDescription(payload.sdp));
+          await handleRemoteSdp(pc, payload.sdp);
           setCall((c) => ({ ...c, status: 'connected' }));
+          console.log('[call] answer applied');
         } catch (e) { console.error('answer error', e); }
       });
       ch.on('broadcast', { event: 'ice' }, async ({ payload }) => {
         if (payload.to !== me.id) return;
-        try { await pc.addIceCandidate(new RTCIceCandidate(payload.candidate)); } catch { /* ignore */ }
+        if (!remoteDescSetRef.current) {
+          pendingIceRef.current.push(payload.candidate);
+          return;
+        }
+        try { await pc.addIceCandidate(new RTCIceCandidate(payload.candidate)); } catch (e) { console.warn('ice', e); }
       });
       ch.on('broadcast', { event: 'end' }, ({ payload }) => {
         if (payload.to !== me.id) return;
@@ -337,16 +386,17 @@ export function MessagesPage() {
         cleanupCall();
       });
       await ch.subscribe();
+      console.log('[call] caller rtc joined', rtcName(me.id, peerId));
 
-      // retry ring every 2s for 15s until callee answers
+      // notify callee on personal inbox (retry 8x every 2s)
       let tries = 0;
       const ringTimer = setInterval(() => {
         tries += 1;
-        if (tries > 7 || !callRef.current.active || callRef.current.status === 'connected') {
+        if (tries > 8 || !callRef.current.active || callRef.current.status === 'connected') {
           clearInterval(ringTimer);
           return;
         }
-        const inbox2 = supabase.channel(`inbox_${peerId}`);
+        const inbox2 = supabase.channel(`inbox_${peerId}_${Date.now()}`);
         void inbox2.subscribe();
         setTimeout(() => {
           void inbox2.send({
@@ -354,8 +404,8 @@ export function MessagesPage() {
             event: 'ring',
             payload: { from: me.id, to: peerId, callType: type },
           });
-          setTimeout(() => { void supabase.removeChannel(inbox2); }, 500);
-        }, 300);
+          setTimeout(() => { void supabase.removeChannel(inbox2); }, 400);
+        }, 250);
       }, 2000);
     } catch (err) {
       console.error('startCall error', err);
@@ -368,24 +418,17 @@ export function MessagesPage() {
   async function acceptCall() {
     if (!me || !call.peerId) return;
     const peerId = call.peerId;
+    setSendError(null);
+    pendingIceRef.current = [];
+    remoteDescSetRef.current = false;
     try {
       const stream = await getMedia(call.type === 'video');
       setLocalStream(stream);
-      if (localVideoRef.current) localVideoRef.current.srcObject = stream;
 
       const pc = new RTCPeerConnection(RTC_CONFIG);
       pcRef.current = pc;
       stream.getTracks().forEach((t) => pc.addTrack(t, stream));
-      pc.ontrack = (ev) => setRemoteStream(ev.streams[0]);
-      pc.onicecandidate = (ev) => {
-        if (ev.candidate && callChannelRef.current) {
-          void callChannelRef.current.send({
-            type: 'broadcast',
-            event: 'ice',
-            payload: { from: me.id, to: peerId, candidate: ev.candidate },
-          });
-        }
-      };
+      wirePc(pc, me.id, peerId);
 
       const ch = supabase.channel(rtcName(peerId, me.id));
       callChannelRef.current = ch;
@@ -393,7 +436,7 @@ export function MessagesPage() {
       ch.on('broadcast', { event: 'offer' }, async ({ payload }) => {
         if (payload.to !== me.id) return;
         try {
-          await pc.setRemoteDescription(new RTCSessionDescription(payload.sdp));
+          await handleRemoteSdp(pc, payload.sdp);
           const answer = await pc.createAnswer();
           await pc.setLocalDescription(answer);
           void ch.send({
@@ -401,12 +444,16 @@ export function MessagesPage() {
             event: 'answer',
             payload: { from: me.id, to: peerId, sdp: answer },
           });
-          setCall((c) => ({ ...c, status: 'connected' }));
+          console.log('[call] answer sent');
         } catch (e) { console.error('offer error', e); }
       });
       ch.on('broadcast', { event: 'ice' }, async ({ payload }) => {
         if (payload.to !== me.id) return;
-        try { await pc.addIceCandidate(new RTCIceCandidate(payload.candidate)); } catch { /* ignore */ }
+        if (!remoteDescSetRef.current) {
+          pendingIceRef.current.push(payload.candidate);
+          return;
+        }
+        try { await pc.addIceCandidate(new RTCIceCandidate(payload.candidate)); } catch (e) { console.warn('ice', e); }
       });
       ch.on('broadcast', { event: 'end' }, ({ payload }) => {
         if (payload.to !== me.id) return;
@@ -414,14 +461,25 @@ export function MessagesPage() {
         cleanupCall();
       });
       await ch.subscribe();
+      console.log('[call] callee rtc joined', rtcName(peerId, me.id));
 
-      // tell caller we're ready for offer
-      void ch.send({
-        type: 'broadcast',
-        event: 'ready',
-        payload: { from: me.id, to: peerId },
-      });
-      setCall((c) => ({ ...c, status: 'connected', active: true }));
+      // tell caller we're ready — retry ready until offer arrives
+      let readyTries = 0;
+      const readyTimer = setInterval(() => {
+        readyTries += 1;
+        if (readyTries > 10 || remoteDescSetRef.current || !callRef.current.active) {
+          clearInterval(readyTimer);
+          return;
+        }
+        void ch.send({
+          type: 'broadcast',
+          event: 'ready',
+          payload: { from: me.id, to: peerId },
+        });
+      }, 1500);
+      void ch.send({ type: 'broadcast', event: 'ready', payload: { from: me.id, to: peerId } });
+
+      setCall((c) => ({ ...c, status: 'connecting' })); // wait for actual ice connected
     } catch (err) {
       console.error('acceptCall error', err);
       setSendError('Could not access mic/camera.');
@@ -671,6 +729,8 @@ export function MessagesPage() {
               </>
             ) : (
               <>
+                <audio ref={remoteAudioRef} autoPlay playsInline style={{ display: 'none' }} />
+                <audio ref={(el) => { if (el && localStream) el.srcObject = localStream; }} autoPlay muted style={{ display: 'none' }} />
                 <div className="call-videos">
                   {call.type === 'video' ? (
                     <>
@@ -681,8 +741,9 @@ export function MessagesPage() {
                     <div className="audio-call">
                       <Avatar url={other?.avatar_url} name={other?.display_name || '?'} size={100} />
                       <h3 style={{ marginTop: 12 }}>{other?.display_name}</h3>
-                      <audio ref={(el) => { if (el && remoteStream) el.srcObject = remoteStream; }} autoPlay />
-                      <audio ref={(el) => { if (el && localStream) el.srcObject = localStream; }} autoPlay muted />
+                      <p className="muted" style={{ marginTop: 4 }}>
+                        {call.status === 'connected' ? '🔊 On call' : 'Connecting…'}
+                      </p>
                     </div>
                   )}
                 </div>
