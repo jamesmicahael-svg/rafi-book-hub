@@ -116,3 +116,5 @@ Triggers: auto-profile on signup; notifications on reaction, comment, message.
 - Media uploads require the `media` storage bucket; without it, text posts still work.
 
 <!-- redeploy: fix invalid api key env -->
+
+Deploy trigger 2026-10-22T01:24:56.3526381+06:00
