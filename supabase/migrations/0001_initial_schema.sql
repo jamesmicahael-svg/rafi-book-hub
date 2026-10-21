@@ -208,7 +208,7 @@ create index if not exists idx_reactions_post on reactions(post_id);
 create index if not exists idx_comments_post on comments(post_id);
 create index if not exists idx_notifications_user on notifications(user_id, read, created_at desc);
 create index if not exists idx_messages_conv on messages(conversation_id, created_at);
-create index if not exists idx_stories_active on stories(expires_at) where expires_at > now();
+create index if not exists idx_stories_active on stories(expires_at);
 create index if not exists idx_friend_requests_receiver on friend_requests(receiver_id, status);
 create index if not exists idx_search_profiles on profiles using gin (to_tsvector('simple', display_name || ' ' || username));
 
