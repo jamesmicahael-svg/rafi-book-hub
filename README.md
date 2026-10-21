@@ -114,3 +114,5 @@ Triggers: auto-profile on signup; notifications on reaction, comment, message.
 - **Do not deploy** unless the product owner explicitly asks (no Vercel/DNS/prod release from this repo's build scripts).
 - First signup: set yourself admin in SQL: `update profiles set is_admin = true where username = 'yourname';`
 - Media uploads require the `media` storage bucket; without it, text posts still work.
+
+<!-- redeploy: fix invalid api key env -->
